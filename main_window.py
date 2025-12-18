@@ -1089,9 +1089,9 @@ class MainWindow(ctk.CTk):
         import time
         current_time = time.time()
         
-        # 限制设置界面开关每秒只能切换一次
-        if current_time - self._last_setting_toggle_time < 1.0:
-            return
+        # 移除速率限制，允许即时切换
+        # if current_time - self._last_setting_toggle_time < 1.0:
+        #     return
             
         self._last_setting_toggle_time = current_time
         
@@ -1133,9 +1133,9 @@ class MainWindow(ctk.CTk):
         import time
         current_time = time.time()
         
-        # 限制设置界面开关每秒只能切换一次
-        if current_time - self._last_setting_toggle_time < 1.0:
-            return
+        # 移除速率限制，允许即时切换
+        # if current_time - self._last_setting_toggle_time < 1.0:
+        #     return
             
         self._last_setting_toggle_time = current_time
         
@@ -1145,6 +1145,9 @@ class MainWindow(ctk.CTk):
                 self.enable_auto_start()
             else:
                 self.disable_auto_start()
+                
+            # 自动保存配置
+            self._schedule_auto_save()
         except Exception as e:
             self.status_label.configure(text=f"切换开机自启动时出错: {str(e)}")
             import traceback
@@ -1530,9 +1533,9 @@ class MainWindow(ctk.CTk):
         import time
         current_time = time.time()
         
-        # 限制设置界面开关每秒只能切换一次
-        if current_time - self._last_setting_toggle_time < 1.0:
-            return
+        # 移除速率限制，允许即时切换
+        # if current_time - self._last_setting_toggle_time < 1.0:
+        #     return
             
         self._last_setting_toggle_time = current_time
         
@@ -1597,9 +1600,9 @@ class MainWindow(ctk.CTk):
         import time
         current_time = time.time()
         
-        # 限制设置界面开关每秒只能切换一次
-        if current_time - self._last_setting_toggle_time < 1.0:
-            return
+        # 移除速率限制，允许即时切换
+        # if current_time - self._last_setting_toggle_time < 1.0:
+        #     return
             
         self._last_setting_toggle_time = current_time
         
@@ -1611,6 +1614,9 @@ class MainWindow(ctk.CTk):
                 self.status_label.configure(text=f"连续保护已{status}")
             else:
                 self.status_label.configure(text="请先启用全屏反截屏保护")
+                
+            # 自动保存配置
+            self._schedule_auto_save()
         except Exception as e:
             self.status_label.configure(text=f"切换连续保护时出错: {str(e)}")
             import traceback
@@ -1621,29 +1627,50 @@ class MainWindow(ctk.CTk):
         import time
         current_time = time.time()
         
-        # 限制设置界面开关每秒只能切换一次
-        if current_time - self._last_setting_toggle_time < 1.0:
-            return
+        # 移除速率限制，允许即时切换
+        # if current_time - self._last_setting_toggle_time < 1.0:
+        #     return
             
         self._last_setting_toggle_time = current_time
         
         try:
             pass  # 子进程注入开关的操作已经在其他地方处理
+            
+            # 自动保存配置
+            self._schedule_auto_save()
         except Exception as e:
             self.status_label.configure(text=f"切换子进程注入时出错: {str(e)}")
             import traceback
             traceback.print_exc()
     
-    def toggle_auto_start(self):
-        """切换开机自启动功能的启用状态"""
+    def apply_fullscreen_interval(self):
+        """应用全屏反截屏保护的间隔设置"""
         import time
         current_time = time.time()
         
-        # 限制设置界面开关每秒只能切换一次
-        if current_time - self._last_setting_toggle_time < 1.0:
-            return
+        # 移除速率限制，允许即时切换
+        # if current_time - self._last_setting_toggle_time < 1.0:
+        #     return
             
         self._last_setting_toggle_time = current_time
+        
+        try:
+            if hasattr(self, 'fullscreen_antiscreenshot'):
+                interval = float(self.fullscreen_interval_var.get())
+                self.fullscreen_antiscreenshot.set_protection_interval(interval)
+                self.status_label.configure(text=f"全屏反截屏保护间隔已设置为 {interval} 秒")
+            else:
+                self.status_label.configure(text="请先启用全屏反截屏保护")
+                
+            # 自动保存配置
+            self._schedule_auto_save()
+        except ValueError:
+            self.status_label.configure(text="请输入有效的数字作为间隔")
+        except Exception as e:
+            self.status_label.configure(text=f"应用间隔设置时出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+
         
         try:
             # 根据开关状态启用或禁用开机自启动
@@ -1661,9 +1688,9 @@ class MainWindow(ctk.CTk):
         import time
         current_time = time.time()
         
-        # 限制设置界面开关每秒只能切换一次
-        if current_time - self._last_setting_toggle_time < 1.0:
-            return
+        # 移除速率限制，允许即时切换
+        # if current_time - self._last_setting_toggle_time < 1.0:
+        #     return
             
         self._last_setting_toggle_time = current_time
         
