@@ -1,1014 +1,17 @@
 import sys
 import os
-import json
 import psutil
 import win32gui
-import win32process
 import customtkinter as ctk
 from tkinter import simpledialog
 import tkinter as tk
 import threading
-import ctypes
-import ctypes.wintypes
-from ctypes import wintypes
 import shutil
 
-# 添加对injector库的支持
-sys.path.append(os.path.join(os.path.dirname(__file__), 'injector'))
-try:
-    from injector import Injector as DLLInjectorLib
-    INJECTOR_AVAILABLE = True
-except ImportError:
-    INJECTOR_AVAILABLE = False
-    print("无法导入injector库，将使用内置注入方法")
-
-# Windows API常量
-PROCESS_ALL_ACCESS = 0x1F0FFF
-MEM_COMMIT = 0x1000
-MEM_RESERVE = 0x2000
-PAGE_EXECUTE_READWRITE = 0x40
-PAGE_READWRITE = 0x04  # 添加缺失的常量定义
-
-# 定义缺失的类型
-LPSECURITY_ATTRIBUTES = ctypes.c_void_p
-
-# Windows API函数
-kernel32 = ctypes.windll.kernel32
-OpenProcess = kernel32.OpenProcess
-OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-OpenProcess.restype = wintypes.HANDLE
-
-VirtualAllocEx = kernel32.VirtualAllocEx
-VirtualAllocEx.argtypes = [wintypes.HANDLE, wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
-VirtualAllocEx.restype = wintypes.LPVOID
-
-WriteProcessMemory = kernel32.WriteProcessMemory
-WriteProcessMemory.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.LPCVOID, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
-WriteProcessMemory.restype = wintypes.BOOL
-
-GetModuleHandle = kernel32.GetModuleHandleW
-GetModuleHandle.argtypes = [wintypes.LPCWSTR]
-GetModuleHandle.restype = wintypes.HANDLE
-
-GetModuleHandleA = kernel32.GetModuleHandleA
-GetModuleHandleA.argtypes = [wintypes.LPCSTR]
-GetModuleHandleA.restype = wintypes.HANDLE
-
-GetProcAddress = kernel32.GetProcAddress
-GetProcAddress.argtypes = [wintypes.HANDLE, wintypes.LPCSTR]
-GetProcAddress.restype = wintypes.LPVOID
-
-
-CreateRemoteThread = kernel32.CreateRemoteThread
-CreateRemoteThread.argtypes = [wintypes.HANDLE, LPSECURITY_ATTRIBUTES, ctypes.c_size_t, wintypes.LPVOID, wintypes.LPVOID, wintypes.DWORD, wintypes.LPDWORD]
-CreateRemoteThread.restype = wintypes.HANDLE
-
-CloseHandle = kernel32.CloseHandle
-CloseHandle.argtypes = [wintypes.HANDLE]
-CloseHandle.restype = wintypes.BOOL
-
-GetLastError = kernel32.GetLastError
-GetLastError.argtypes = []
-GetLastError.restype = wintypes.DWORD
-
-# 如果injector库不可用，则保留原有的API定义
-if not INJECTOR_AVAILABLE:
-    # 这里保留原有的API定义，供内置注入方法使用
-    pass
-
-# 引入win32file用于检测进程架构
-try:
-    import win32file
-    WIN32FILE_AVAILABLE = True
-except ImportError:
-    WIN32FILE_AVAILABLE = False
-    print("无法导入win32file模块，将无法自动检测进程架构")
-
-
-class DLLInjector:
-    """DLL注入器类，用于向目标进程注入DLL"""
-    
-    _instance = None
-    _initialized = False
-    _injection_locks = set()  # 用于防止对同一进程的重复注入
-    
-    def __new__(cls):
-        """单例模式，确保只创建一个实例"""
-        if cls._instance is None:
-            cls._instance = super(DLLInjector, cls).__new__(cls)
-        return cls._instance
-    
-    def __init__(self):
-        """初始化DLL注入器"""
-        # 确保只初始化一次
-        if not DLLInjector._initialized:
-            print("初始化DLL注入器")
-            DLLInjector._initialized = True
-        
-    def _get_process_architecture(self, process_id):
-        """
-        获取进程的架构类型（32位或64位）
-        
-        Args:
-            process_id (int): 进程ID
-            
-        Returns:
-            str: "x86" 表示32位进程, "x64" 表示64位进程, None 表示无法确定
-        """
-        if not WIN32FILE_AVAILABLE:
-            print("win32file不可用，无法检测进程架构")
-            return None
-            
-        try:
-            # 获取进程句柄
-            process_handle = OpenProcess(PROCESS_ALL_ACCESS, False, process_id)
-            if not process_handle:
-                print(f"无法打开进程 {process_id} 来检测架构")
-                return None
-                
-            # 获取进程映像文件路径
-            import win32process
-            process_path = win32process.GetModuleFileNameEx(process_handle, 0)
-            CloseHandle(process_handle)
-            
-            print(f"检测进程 {process_id} 的可执行文件路径: {process_path}")
-            
-            # 使用win32file.GetBinaryType检测架构
-            binary_type = win32file.GetBinaryType(process_path)
-            print(f"进程 {process_id} 的二进制类型: {binary_type}")
-            
-            if binary_type == win32file.SCS_32BIT_BINARY:
-                print(f"进程 {process_id} 是32位程序")
-                return "x86"
-            else:
-                # 如果不是32位，则认为是64位
-                print(f"进程 {process_id} 是64位程序")
-                return "x64"
-        except Exception as e:
-            print(f"检测进程 {process_id} 架构时出错: {e}")
-            return None
-    
-    def _get_architecture_specific_dll_path(self, dll_name, process_id):
-        """
-        根据进程架构获取相应的DLL路径
-        
-        Args:
-            dll_name (str): DLL文件名
-            process_id (int): 目标进程ID
-            
-        Returns:
-            str: 对应架构的DLL文件路径，如果无法确定则返回默认路径
-        """
-        # 获取进程架构
-        architecture = self._get_process_architecture(process_id)
-        
-        # 基础DLL目录
-        # 处理PyInstaller打包环境 - 使用程序同目录
-        if hasattr(sys, '_MEIPASS'):
-            # 在打包环境中，使用程序同目录
-            base_dll_dir = os.path.join(os.path.dirname(sys.executable), "dll")
-        else:
-            # 在开发环境中
-            base_dll_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dll")
-        
-        print(f"基础DLL目录: {base_dll_dir}")
-        
-        if architecture:
-            # 根据架构选择对应的DLL目录
-            arch_dll_dir = os.path.join(base_dll_dir, architecture)
-            arch_dll_path = os.path.join(arch_dll_dir, dll_name)
-            
-            # 检查架构特定的DLL是否存在
-            if os.path.exists(arch_dll_path):
-                print(f"为进程 {process_id} 选择 {architecture} 版本的DLL: {arch_dll_path}")
-                return arch_dll_path
-            else:
-                print(f"未找到 {architecture} 版本的DLL: {arch_dll_path}")
-        else:
-            print(f"无法确定进程 {process_id} 的架构，使用默认DLL路径")
-        
-        # 如果无法确定架构或对应DLL不存在，使用默认路径
-        # 默认使用x64版本DLL（大多数现代系统都是64位）
-        default_arch = "x64"
-        default_dll_path = os.path.join(base_dll_dir, default_arch, dll_name)
-        if os.path.exists(default_dll_path):
-            print(f"使用默认架构({default_arch})的DLL路径: {default_dll_path}")
-            return default_dll_path
-            
-        # 最后的备选方案
-        fallback_path = os.path.join(base_dll_dir, dll_name)
-        print(f"使用最终备选DLL路径: {fallback_path}")
-        return fallback_path
-
-    def _extract_dll_files_if_needed(self):
-        """
-        如果需要，将DLL文件从打包程序中解压到程序同目录
-        """
-        # 检查目标DLL目录是否已存在
-        target_dll_dir = os.path.join(os.path.dirname(sys.executable), "dll")
-        if os.path.exists(target_dll_dir):
-            # 检查必要的子目录是否存在
-            x86_dir = os.path.join(target_dll_dir, "x86")
-            x64_dir = os.path.join(target_dll_dir, "x64")
-            if os.path.exists(x86_dir) and os.path.exists(x64_dir):
-                print("DLL架构目录已存在，跳过解压")
-                return
-        
-        # 创建目标目录
-        os.makedirs(target_dll_dir, exist_ok=True)
-        
-        # 从打包资源中复制DLL文件
-        source_dll_dir = os.path.join(sys._MEIPASS, "dll")
-        if os.path.exists(source_dll_dir):
-            print(f"正在将DLL文件从 {source_dll_dir} 复制到 {target_dll_dir}")
-            try:
-                # 分别复制x86和x64目录
-                source_x86_dir = os.path.join(source_dll_dir, "x86")
-                source_x64_dir = os.path.join(source_dll_dir, "x64")
-                target_x86_dir = os.path.join(target_dll_dir, "x86")
-                target_x64_dir = os.path.join(target_dll_dir, "x64")
-                
-                if os.path.exists(source_x86_dir):
-                    os.makedirs(target_x86_dir, exist_ok=True)
-                    for file in os.listdir(source_x86_dir):
-                        source_file = os.path.join(source_x86_dir, file)
-                        target_file = os.path.join(target_x86_dir, file)
-                        shutil.copy2(source_file, target_file)
-                
-                if os.path.exists(source_x64_dir):
-                    os.makedirs(target_x64_dir, exist_ok=True)
-                    for file in os.listdir(source_x64_dir):
-                        source_file = os.path.join(source_x64_dir, file)
-                        target_file = os.path.join(target_x64_dir, file)
-                        shutil.copy2(source_file, target_file)
-                
-                print("DLL文件解压完成")
-            except Exception as e:
-                print(f"解压DLL文件时出错: {e}")
-        else:
-            print(f"源DLL目录不存在: {source_dll_dir}")
-    def inject_dll(self, process_id, dll_path):
-        """
-        向指定进程注入DLL
-        
-        Args:
-            process_id (int): 目标进程ID
-            dll_path (str): DLL文件的完整路径
-            
-        Returns:
-            bool: 注入是否成功
-        """
-        # 检查是否正在对同一进程进行注入
-        if process_id in DLLInjector._injection_locks:
-            print(f"进程 {process_id} 正在注入中，跳过重复注入")
-            return False
-            
-        # 设置注入锁
-        DLLInjector._injection_locks.add(process_id)
-        
-        try:
-            # 导入os模块以使用path相关函数
-            import os
-            
-            # 检查DLL文件是否存在
-            if not os.path.exists(dll_path):
-                print(f"DLL文件不存在: {dll_path}")
-                return False
-                
-            # 如果injector库可用，则使用它进行注入
-            if INJECTOR_AVAILABLE:
-                try:
-                    # 创建injector实例
-                    injector = DLLInjectorLib()
-                    # 加载进程
-                    injector.load_from_pid(process_id)
-                    # 注入DLL
-                    injector.inject_dll(dll_path)
-                    # 卸载以关闭进程句柄
-                    injector.unload()
-                    print(f"为进程 {process_id} 注入 {os.path.basename(dll_path)} 成功")
-                    return True
-                except Exception as e:
-                    print(f"使用injector库注入DLL时发生异常: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    return False
-            else:
-                # 使用原有的注入方法
-                # 打开目标进程
-                process_handle = OpenProcess(PROCESS_ALL_ACCESS, False, process_id)
-                if not process_handle:
-                    error_code = GetLastError()
-                    print(f"无法打开进程 {process_id}，错误码: {error_code}")
-                    return False
-
-                # 检查进程是否仍处于活动状态
-                exit_code = wintypes.DWORD()
-                if kernel32.GetExitCodeProcess(process_handle, ctypes.byref(exit_code)):
-                    if exit_code.value != 259:  # STILL_ACTIVE = 259
-                        print(f"进程 {process_id} 已经退出，无法注入DLL")
-                        CloseHandle(process_handle)
-                        return False
-
-                # 尝试提升当前进程权限
-                try:
-                    import win32api
-                    import win32security
-                    import ntsecuritycon as con
-                    
-                    # 获取当前进程令牌
-                    token = win32security.OpenProcessToken(
-                        win32api.GetCurrentProcess(),
-                        0x000F01FF  # TOKEN_ALL_ACCESS的值
-                    )
-                    
-                    # 启用调试权限
-                    win32security.AdjustTokenPrivileges(
-                        token,
-                        False,
-                        [(win32security.LookupPrivilegeValue(None, "SeDebugPrivilege"), con.SE_PRIVILEGE_ENABLED)]
-                    )
-                    print("已尝试提升调试权限")
-                except Exception as e:
-                    print(f"无法提升调试权限: {e}")
-
-                # 在目标进程中分配内存用于存储DLL路径
-                # 使用UTF-16编码路径（宽字符串）
-                dll_path_bytes = dll_path.encode('utf-16le') + b'\x00\x00'  # UTF-16 LE with null terminator
-                path_size = len(dll_path_bytes)
-
-                allocated_memory = VirtualAllocEx(
-                    process_handle,
-                    None,
-                    path_size,
-                    MEM_COMMIT | MEM_RESERVE,
-                    PAGE_READWRITE
-                )
-
-                if not allocated_memory:
-                    error_code = GetLastError()
-                    print(f"无法在目标进程中分配内存，错误码: {error_code}")
-                    CloseHandle(process_handle)
-                    return False
-
-                # 将DLL路径写入目标进程内存
-                written_bytes = ctypes.c_size_t(0)
-                if not WriteProcessMemory(
-                    process_handle,
-                    allocated_memory,
-                    dll_path_bytes,
-                    path_size,
-                    ctypes.byref(written_bytes)
-                ):
-                    error_code = GetLastError()
-                    print(f"无法向目标进程写入DLL路径，错误码: {error_code}")
-                    # 释放已分配的内存
-                    kernel32.VirtualFreeEx(process_handle, allocated_memory, 0, 0x8000)  # MEM_RELEASE
-                    CloseHandle(process_handle)
-                    return False
-
-                # 检查实际写入的字节数
-                if written_bytes.value != path_size:
-                    print(f"写入DLL路径大小不匹配: 期望 {path_size} 字节, 实际 {written_bytes.value} 字节")
-                    # 释放已分配的内存
-                    kernel32.VirtualFreeEx(process_handle, allocated_memory, 0, 0x8000)  # MEM_RELEASE
-                    CloseHandle(process_handle)
-                    return False
-
-                # 获取LoadLibraryW函数地址 (使用宽字符串版本)
-                kernel32_handle = GetModuleHandle("kernel32.dll")
-                if not kernel32_handle:
-                    error_code = GetLastError()
-                    print(f"无法获取kernel32.dll句柄，错误码: {error_code}")
-                    # 释放已分配的内存
-                    kernel32.VirtualFreeEx(process_handle, allocated_memory, 0, 0x8000)  # MEM_RELEASE
-                    CloseHandle(process_handle)
-                    return False
-
-                load_library_addr = GetProcAddress(kernel32_handle, b"LoadLibraryW")
-                if not load_library_addr:
-                    error_code = GetLastError()
-                    print(f"无法获取LoadLibraryW地址，错误码: {error_code}")
-                    # 释放已分配的内存
-                    kernel32.VirtualFreeEx(process_handle, allocated_memory, 0, 0x8000)  # MEM_RELEASE
-                    CloseHandle(process_handle)
-                    return False
-
-                # 创建远程线程执行LoadLibraryW加载DLL
-                thread_handle = CreateRemoteThread(
-                    process_handle,
-                    None,
-                    0,
-                    load_library_addr,
-                    allocated_memory,
-                    0,
-                    None
-                )
-
-                if not thread_handle:
-                    error_code = GetLastError()
-                    print(f"无法创建远程线程，错误码: {error_code}")
-                    # 释放已分配的内存
-                    kernel32.VirtualFreeEx(process_handle, allocated_memory, 0, 0x8000)  # MEM_RELEASE
-                    CloseHandle(process_handle)
-                    return False
-
-                # 等待线程执行完成（最多等待10秒）
-                result = kernel32.WaitForSingleObject(thread_handle, 10000)
-                if result == 0xFFFFFFFF:  # WAIT_FAILED
-                    print(f"等待线程完成时出错，进程 {process_id}")
-                elif result == 0x00000102:  # WAIT_TIMEOUT
-                    print(f"等待线程完成超时，进程 {process_id}")
-                else:
-                    print(f"线程执行完成，进程 {process_id}")
-
-                # 获取线程退出码来检查DLL是否成功加载
-                exit_code = wintypes.DWORD()
-                dll_loaded = False
-                if kernel32.GetExitCodeThread(thread_handle, ctypes.byref(exit_code)):
-                    print(f"DLL加载线程退出码: {exit_code.value}")
-                    # 如果退出码为非零值，表示DLL加载成功（返回加载模块的句柄）
-                    dll_loaded = (exit_code.value != 0)
-                    
-                    # 如果退出码为0，尝试获取更多错误信息
-                    if not dll_loaded:
-                        last_error = GetLastError()
-                        print(f"LoadLibraryW执行失败，错误码: {last_error}")
-                        
-                        # 检查DLL文件是否存在且可访问
-                        import os
-                        if not os.path.exists(dll_path):
-                            print(f"DLL文件不存在或无法访问: {dll_path}")
-                        else:
-                            print(f"DLL文件存在且可访问: {dll_path}")
-
-                # 清理资源
-                CloseHandle(thread_handle)
-                # 延迟释放内存，确保LoadLibrary执行完成
-                import time
-                time.sleep(0.1)
-                kernel32.VirtualFreeEx(process_handle, allocated_memory, 0, 0x8000)  # MEM_RELEASE
-                CloseHandle(process_handle)
-
-                # 根据退出码判断注入是否成功
-                if not dll_loaded:
-                    print(f"为进程 {process_id} 注入 {os.path.basename(dll_path)} 失败")
-                    return False
-                    
-                print(f"为进程 {process_id} 注入 {os.path.basename(dll_path)} 成功")
-                return True
-
-        except Exception as e:
-            print(f"注入DLL时发生异常: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-        finally:
-            # 清除注入锁
-            if process_id in DLLInjector._injection_locks:
-                DLLInjector._injection_locks.remove(process_id)
-
-    def inject_affinity_hide_dll(self, process_id):
-        """
-        向指定进程注入AffinityHide.dll (模式二)
-
-        Args:
-            process_id (int): 目标进程ID
-
-        Returns:
-            bool: 注入是否成功
-        """
-        dll_path = self._get_architecture_specific_dll_path("AffinityHide.dll", process_id)
-        return self.inject_dll(process_id, dll_path)
-
-    def inject_affinity_trans_dll(self, process_id):
-        """
-        向指定进程注入AffinityTrans.dll (模式一)
-        
-        Args:
-            process_id (int): 目标进程ID
-            
-        Returns:
-            bool: 注入是否成功
-        """
-        dll_path = self._get_architecture_specific_dll_path("AffinityTrans.dll", process_id)
-        return self.inject_dll(process_id, dll_path)
-
-    def inject_affinity_unhide_dll(self, process_id):
-        """
-        向指定进程注入AffinityUnhide.dll (取消反截屏)
-        
-        Args:
-            process_id (int): 目标进程ID
-            
-        Returns:
-            bool: 注入是否成功
-        """
-        dll_path = self._get_architecture_specific_dll_path("AffinityUnhide.dll", process_id)
-        return self.inject_dll(process_id, dll_path)
-
-    def inject_affinity_status_dll(self, process_id):
-        """
-        向指定进程注入AffinityStatus.dll (检查状态)
-        
-        Args:
-            process_id (int): 目标进程ID
-            
-        Returns:
-            bool: 注入是否成功
-        """
-        dll_path = self._get_architecture_specific_dll_path("AffinityStatus.dll", process_id)
-        return self.inject_dll(process_id, dll_path)
-
-
-class ProcessLoader:
-    """进程列表加载线程"""
-    def __init__(self, callback):
-        self.callback = callback
-        self.process_dict = {}
-        
-    def run(self):
-        try:
-            # 收集所有进程信息
-            for proc in psutil.process_iter():
-                try:
-                    pid = proc.pid
-                    name = proc.name()
-                    
-                    try:
-                        ppid = proc.ppid()
-                    except:
-                        ppid = 0
-                    
-                    if name not in self.process_dict:
-                        self.process_dict[name] = {
-                            'pids': [pid],
-                            'ppids': [ppid],
-                            'count': 1
-                        }
-                    else:
-                        self.process_dict[name]['pids'].append(pid)
-                        self.process_dict[name]['ppids'].append(ppid)
-                        self.process_dict[name]['count'] += 1
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    pass
-            
-            # 格式化输出
-            processes = []
-            for name, info in self.process_dict.items():
-                if info['count'] == 1:
-                    process_info = f"{name} (PID: {info['pids'][0]})"
-                else:
-                    process_info = f"{name} ({info['count']} 个实例)"
-                processes.append((process_info, name))
-                
-            # 调用回调函数传递结果
-            self.callback(sorted(processes, key=lambda x: x[0]))
-        except Exception as e:
-            self.callback([])
-
-
-class WindowLoader:
-    """窗口列表加载线程"""
-    def __init__(self, callback):
-        self.callback = callback
-        
-    def run(self):
-        windows = []
-        
-        def enum_windows_callback(hwnd, windows_list):
-            if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd):
-                try:
-                    window_text = win32gui.GetWindowText(hwnd)
-                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                    process_name = "unknown"
-                    try:
-                        process = psutil.Process(pid)
-                        process_name = process.name()
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
-                    # 使用标准格式: "窗口标题 [进程名]"
-                    window_info = f"{window_text} [{process_name}]"
-                    windows_list.append((window_info, process_name))
-                except Exception:
-                    pass
-            return True
-            
-        try:
-            win32gui.EnumWindows(enum_windows_callback, windows)
-            self.callback(sorted(windows, key=lambda x: x[0]))
-        except Exception as e:
-            self.callback([])
-
-
-class UIComponents:
-    """界面组件类，负责创建和管理UI元素"""
-
-    def __init__(self, main_window):
-        """初始化UI组件"""
-        self.main_window = main_window
-        
-    def create_main_layout(self):
-        """创建主布局框架"""
-        # 创建主框架
-        self.main_frame = ctk.CTkFrame(self.main_window, fg_color="transparent")
-        self.main_frame.pack(fill="both", expand=True, padx=10, pady=10)
-        
-        # 创建状态栏
-        self.status_frame = ctk.CTkFrame(self.main_frame)
-        self.status_frame.pack(fill="x", side="bottom", padx=5, pady=5)
-        
-        self.main_window.status_label = ctk.CTkLabel(self.status_frame, text="就绪", anchor="w")
-        self.main_window.status_label.pack(side="left", padx=5, pady=5, fill="x", expand=True)
-        
-        # 创建进度条（初始隐藏）
-        self.main_window.progress_bar = ctk.CTkProgressBar(self.status_frame)
-        self.main_window.progress_bar.pack(side="right", padx=5, pady=5)
-        self.main_window.progress_bar.set(0)
-        self.main_window.progress_bar.pack_forget()  # 初始隐藏
-        
-        # 创建主内容框架
-        self.content_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
-        self.content_frame.pack(fill="both", expand=True, padx=5, pady=5)
-        
-        # 创建水平分割框架
-        self.split_frame = ctk.CTkFrame(self.content_frame, fg_color="transparent")
-        self.split_frame.pack(fill="both", expand=True)
-        
-        # 创建左侧区域（固定宽度200像素）
-        self.main_window.left_frame = ctk.CTkFrame(self.split_frame, width=200, fg_color="transparent")
-        self.main_window.left_frame.pack(side="left", fill="y", padx=(0, 5))
-        self.main_window.left_frame.pack_propagate(False)  # 保持固定宽度
-        
-        # 创建中间主控区
-        self.main_window.center_frame = ctk.CTkFrame(self.split_frame, fg_color="transparent")
-        self.main_window.center_frame.pack(side="left", fill="both", expand=True)
-        
-        # 创建标签页视图
-        self.main_window.tab_view = ctk.CTkTabview(self.main_window.center_frame)
-        self.main_window.tab_view.pack(fill="both", expand=True, padx=5, pady=5)
-        
-        # 添加标签页
-        self.main_window.control_tab = self.main_window.tab_view.add("控制")
-        self.main_window.settings_tab = self.main_window.tab_view.add("设置")
-        self.main_window.about_tab = self.main_window.tab_view.add("关于")
-        
-    def create_mode1_section(self):
-        """创建模式一列表区域"""
-        self.main_window.mode1_frame = ctk.CTkFrame(self.main_window.left_frame)
-        self.main_window.mode1_frame.pack(fill="both", expand=True, padx=5, pady=2)
-        
-        # 模式一标题
-        mode1_label = ctk.CTkLabel(self.main_window.mode1_frame, text="模式一", font=ctk.CTkFont(size=14, weight="bold"))
-        mode1_label.pack(pady=(3, 0))
-        
-        # 模式一列表框
-        self.main_window.mode1_listbox_frame = ctk.CTkFrame(self.main_window.mode1_frame)
-        self.main_window.mode1_listbox_frame.pack(fill="both", expand=True, padx=5, pady=3)
-        
-        self.main_window.mode1_listbox = tk.Listbox(
-            self.main_window.mode1_listbox_frame, 
-            bg="white", 
-            fg="black",
-            selectbackground="#3B8ED0",
-            selectforeground="white"
-        )
-        self.main_window.mode1_listbox.pack(side="left", fill="both", expand=True)
-        
-        # 添加滚动条
-        mode1_scrollbar = ctk.CTkScrollbar(self.main_window.mode1_listbox_frame, command=self.main_window.mode1_listbox.yview)
-        mode1_scrollbar.pack(side="right", fill="y")
-        self.main_window.mode1_listbox.configure(yscrollcommand=mode1_scrollbar.set)
-        
-        # 绑定右键菜单
-        self.main_window.mode1_listbox.bind("<Button-3>", lambda e: self.main_window.show_mode_list_context_menu(e, self.main_window.mode1_listbox, "模式一"))
-        
-        # 模式一按钮框架
-        mode1_buttons_frame = ctk.CTkFrame(self.main_window.mode1_frame)
-        mode1_buttons_frame.pack(fill="x", padx=5, pady=(0, 3))
-        
-        self.main_window.mode1_add_btn = ctk.CTkButton(mode1_buttons_frame, text="添加", width=50, height=25, 
-                                              font=ctk.CTkFont(size=14), command=lambda: self.main_window.add_custom_item(self.main_window.mode1_listbox, "模式一"))
-        self.main_window.mode1_add_btn.pack(side="left", padx=2, pady=2, fill="x", expand=True)
-        
-        self.main_window.mode1_remove_btn = ctk.CTkButton(mode1_buttons_frame, text="移除", width=50, height=25,
-                                                 font=ctk.CTkFont(size=14), command=lambda: self.main_window.remove_selected_item(self.main_window.mode1_listbox, "模式一"))
-        self.main_window.mode1_remove_btn.pack(side="left", padx=2, pady=2, fill="x", expand=True)
-        
-        self.main_window.mode1_clear_btn = ctk.CTkButton(mode1_buttons_frame, text="清空", width=50, height=25,
-                                                font=ctk.CTkFont(size=14), command=lambda: self.main_window.clear_list(self.main_window.mode1_listbox, "模式一"))
-        self.main_window.mode1_clear_btn.pack(side="left", padx=2, pady=2, fill="x", expand=True)
-        
-    def create_mode2_section(self):
-        """创建模式二列表区域"""
-        self.main_window.mode2_frame = ctk.CTkFrame(self.main_window.left_frame)
-        self.main_window.mode2_frame.pack(fill="both", expand=True, padx=5, pady=2)
-        
-        # 模式二标题
-        mode2_label = ctk.CTkLabel(self.main_window.mode2_frame, text="模式二", font=ctk.CTkFont(size=14, weight="bold"))
-        mode2_label.pack(pady=(3, 0))
-        
-        # 模式二列表框
-        self.main_window.mode2_listbox_frame = ctk.CTkFrame(self.main_window.mode2_frame)
-        self.main_window.mode2_listbox_frame.pack(fill="both", expand=True, padx=5, pady=3)
-        
-        self.main_window.mode2_listbox = tk.Listbox(
-            self.main_window.mode2_listbox_frame, 
-            bg="white", 
-            fg="black",
-            selectbackground="#3B8ED0",
-            selectforeground="white"
-        )
-        self.main_window.mode2_listbox.pack(side="left", fill="both", expand=True)
-        
-        # 添加滚动条
-        mode2_scrollbar = ctk.CTkScrollbar(self.main_window.mode2_listbox_frame, command=self.main_window.mode2_listbox.yview)
-        mode2_scrollbar.pack(side="right", fill="y")
-        self.main_window.mode2_listbox.configure(yscrollcommand=mode2_scrollbar.set)
-        
-        # 绑定右键菜单
-        self.main_window.mode2_listbox.bind("<Button-3>", lambda e: self.main_window.show_mode_list_context_menu(e, self.main_window.mode2_listbox, "模式二"))
-        
-        # 模式二按钮框架
-        mode2_buttons_frame = ctk.CTkFrame(self.main_window.mode2_frame)
-        mode2_buttons_frame.pack(fill="x", padx=5, pady=(0, 3))
-        
-        self.main_window.mode2_add_btn = ctk.CTkButton(mode2_buttons_frame, text="添加", width=50, height=25,
-                                              font=ctk.CTkFont(size=14), command=lambda: self.main_window.add_custom_item(self.main_window.mode2_listbox, "模式二"))
-        self.main_window.mode2_add_btn.pack(side="left", padx=2, pady=2, fill="x", expand=True)
-        
-        self.main_window.mode2_remove_btn = ctk.CTkButton(mode2_buttons_frame, text="移除", width=50, height=25,
-                                                 font=ctk.CTkFont(size=14), command=lambda: self.main_window.remove_selected_item(self.main_window.mode2_listbox, "模式二"))
-        self.main_window.mode2_remove_btn.pack(side="left", padx=2, pady=2, fill="x", expand=True)
-        
-        self.main_window.mode2_clear_btn = ctk.CTkButton(mode2_buttons_frame, text="清空", width=50, height=25,
-                                                font=ctk.CTkFont(size=14), command=lambda: self.main_window.clear_list(self.main_window.mode2_listbox, "模式二"))
-        self.main_window.mode2_clear_btn.pack(side="left", padx=2, pady=2, fill="x", expand=True)
-
-    def create_control_tab(self):
-        """创建控制标签页"""
-        # 创建按钮框架，将模式切换按钮和刷新按钮放在同一行
-        button_frame = ctk.CTkFrame(self.main_window.control_tab)
-        button_frame.pack(pady=10, padx=10, fill="x")
-        
-        # 创建切换按钮
-        self.main_window.current_mode = 1  # 1表示模式一，2表示模式二
-        self.main_window.toggle_button = ctk.CTkButton(button_frame, text="当前模式: 模式一", 
-                                          command=self.main_window.toggle_mode, 
-                                          font=ctk.CTkFont(size=12, weight="bold"),
-                                          width=150, height=30)
-        self.main_window.toggle_button.pack(side="left", padx=(0, 10))
-        
-        # 添加刷新按钮
-        self.main_window.refresh_windows_btn = ctk.CTkButton(button_frame, text="刷新窗口列表", width=120, command=self.main_window.refresh_windows_list)
-        self.main_window.refresh_windows_btn.pack(side="left", padx=(0, 5))
-        
-        self.main_window.refresh_processes_btn = ctk.CTkButton(button_frame, text="刷新进程列表", width=120, command=self.main_window.refresh_processes_list)
-        self.main_window.refresh_processes_btn.pack(side="left", padx=(0, 5))
-        
-        # 创建窗口列表区域
-        window_frame = ctk.CTkFrame(self.main_window.control_tab)
-        window_frame.pack(fill="both", expand=True, padx=10, pady=3)
-        
-        window_label = ctk.CTkLabel(window_frame, text="窗口列表 (双击添加)", font=ctk.CTkFont(size=12, weight="bold"))
-        window_label.pack(pady=(3, 0))
-        
-        # 窗口列表框
-        self.main_window.window_listbox_frame = ctk.CTkFrame(window_frame)
-        self.main_window.window_listbox_frame.pack(fill="both", expand=True, padx=5, pady=3)
-        
-        self.main_window.window_listbox = tk.Listbox(
-            self.main_window.window_listbox_frame,
-            bg="white",
-            fg="black",
-            selectmode=tk.EXTENDED,
-            selectbackground="#3B8ED0",
-            selectforeground="white"
-        )
-        self.main_window.window_listbox.pack(side="left", fill="both", expand=True)
-        self.main_window.window_listbox.bind("<Double-Button-1>", lambda e: self.main_window.add_to_current_mode_from_list(self.main_window.window_listbox))
-        
-        # 添加滚动条
-        window_scrollbar = ctk.CTkScrollbar(self.main_window.window_listbox_frame, command=self.main_window.window_listbox.yview)
-        window_scrollbar.pack(side="right", fill="y")
-        self.main_window.window_listbox.configure(yscrollcommand=window_scrollbar.set)
-        
-        # 创建进程列表区域
-        process_frame = ctk.CTkFrame(self.main_window.control_tab)
-        process_frame.pack(fill="both", expand=True, padx=10, pady=3)
-        
-        process_label = ctk.CTkLabel(process_frame, text="进程列表 (双击添加)", font=ctk.CTkFont(size=12, weight="bold"))
-        process_label.pack(pady=(3, 0))
-        
-        # 进程列表框
-        self.main_window.process_listbox_frame = ctk.CTkFrame(process_frame)
-        self.main_window.process_listbox_frame.pack(fill="both", expand=True, padx=5, pady=3)
-        
-        self.main_window.process_listbox = tk.Listbox(
-            self.main_window.process_listbox_frame,
-            bg="white",
-            fg="black",
-            selectmode=tk.EXTENDED,
-            selectbackground="#3B8ED0",
-            selectforeground="white"
-        )
-        self.main_window.process_listbox.pack(side="left", fill="both", expand=True)
-        self.main_window.process_listbox.bind("<Double-Button-1>", lambda e: self.main_window.add_to_current_mode_from_list(self.main_window.process_listbox))
-        
-        # 添加滚动条
-        process_scrollbar = ctk.CTkScrollbar(self.main_window.process_listbox_frame, command=self.main_window.process_listbox.yview)
-        process_scrollbar.pack(side="right", fill="y")
-        self.main_window.process_listbox.configure(yscrollcommand=process_scrollbar.set)
-        
-        # 添加说明标签
-        instruction_label = ctk.CTkLabel(self.main_window.control_tab, text="说明：双击列表项可添加到当前模式", 
-                                        text_color="blue", font=ctk.CTkFont(size=12))
-        instruction_label.pack(pady=3)
-        
-    def create_settings_tab(self):
-        """创建设置标签页"""
-        settings_label = ctk.CTkLabel(self.main_window.settings_tab, text="程序设置", font=ctk.CTkFont(size=16, weight="bold"))
-        settings_label.pack(pady=5)
-        
-        # 主题设置
-        theme_label = ctk.CTkLabel(self.main_window.settings_tab, text="主题设置", font=ctk.CTkFont(size=14, weight="bold"))
-        theme_label.pack(pady=(5, 2), anchor="w", padx=10)
-        
-        # 主题切换框架
-        theme_frame = ctk.CTkFrame(self.main_window.settings_tab)
-        theme_frame.pack(fill="x", padx=10, pady=1)
-        
-        theme_label = ctk.CTkLabel(theme_frame, text="选择主题:")
-        theme_label.pack(side="left", padx=10, pady=1)
-        
-        # 主题选项
-        self.main_window.theme_var = ctk.StringVar(value="Light")  # 默认主题
-        light_radio = ctk.CTkRadioButton(theme_frame, text="浅色主题", variable=self.main_window.theme_var, value="Light", command=self.main_window.change_theme)
-        light_radio.pack(side="left", padx=10, pady=1)
-        
-        dark_radio = ctk.CTkRadioButton(theme_frame, text="深色主题", variable=self.main_window.theme_var, value="Dark", command=self.main_window.change_theme)
-        dark_radio.pack(side="left", padx=10, pady=1)
-        
-        # 子进程注入设置
-        child_process_injection_desc = ctk.CTkLabel(
-            self.main_window.settings_tab,
-            text="子进程注入设置",
-            font=ctk.CTkFont(size=14, weight="bold")
-        )
-        child_process_injection_desc.pack(pady=(10, 2), anchor="w", padx=10)
-        
-        child_process_injection_note = ctk.CTkLabel(
-            self.main_window.settings_tab,
-            text="向指定程序的所有子进程注入反截屏保护",
-            font=ctk.CTkFont(size=12),
-            text_color="gray"
-        )
-        child_process_injection_note.pack(pady=(0, 2), anchor="w", padx=15)
-        
-        # 子进程注入开关
-        child_process_injection_frame = ctk.CTkFrame(self.main_window.settings_tab)
-        child_process_injection_frame.pack(fill="x", padx=10, pady=2)
-        
-        child_process_injection_label = ctk.CTkLabel(child_process_injection_frame, text="启用子进程注入:")
-        child_process_injection_label.pack(side="left", padx=10, pady=5)
-        
-        # 子进程注入开关，默认关闭
-        self.main_window.child_process_injection_var = ctk.BooleanVar(value=False)
-        self.main_window.child_process_injection_switch = ctk.CTkSwitch(
-            child_process_injection_frame,
-            text="",
-            variable=self.main_window.child_process_injection_var
-        )
-        self.main_window.child_process_injection_switch.pack(side="left", padx=10, pady=5)
-        
-        # 开机自启动设置
-        auto_start_desc = ctk.CTkLabel(
-            self.main_window.settings_tab,
-            text="开机自启动设置",
-            font=ctk.CTkFont(size=14, weight="bold")
-        )
-        auto_start_desc.pack(pady=(10, 2), anchor="w", padx=10)
-        
-        auto_start_note = ctk.CTkLabel(
-            self.main_window.settings_tab,
-            text="程序将在Windows启动时自动运行",
-            font=ctk.CTkFont(size=12),
-            text_color="gray"
-        )
-        auto_start_note.pack(pady=(0, 2), anchor="w", padx=15)
-        
-        # 开机自启动开关
-        auto_start_frame = ctk.CTkFrame(self.main_window.settings_tab)
-        auto_start_frame.pack(fill="x", padx=10, pady=2)
-        
-        auto_start_label = ctk.CTkLabel(auto_start_frame, text="启用开机自启动:")
-        auto_start_label.pack(side="left", padx=10, pady=5)
-        
-        # 开机自启动开关
-        self.main_window.auto_start_var = ctk.BooleanVar(value=False)
-        self.main_window.auto_start_switch = ctk.CTkSwitch(
-            auto_start_frame,
-            text="",
-            variable=self.main_window.auto_start_var,
-            command=self.main_window.toggle_auto_start
-        )
-        self.main_window.auto_start_switch.pack(side="left", padx=10, pady=5)
-        
-        # 初始化开机自启动开关状态
-        self.main_window.auto_start_var.set(self.main_window.is_auto_start_enabled())
-        
-        
-        # 功能按钮区域
-        functions_label = ctk.CTkLabel(self.main_window.settings_tab, text="功能操作", font=ctk.CTkFont(size=14, weight="bold"))
-        functions_label.pack(pady=(10, 2), anchor="w", padx=10)
-        
-        # 功能按钮框架
-        functions_frame = ctk.CTkFrame(self.main_window.settings_tab)
-        functions_frame.pack(fill="x", padx=10, pady=2)
-        
-        # 将按钮放在一行里
-        buttons_frame = ctk.CTkFrame(functions_frame, fg_color="transparent")
-        buttons_frame.pack(fill="x", padx=10, pady=5)
-        
-        # 保存和加载按钮放在同一行
-        save_btn = ctk.CTkButton(buttons_frame, text="保存", width=80, height=25, 
-                                font=ctk.CTkFont(size=11), command=lambda: self.main_window.save_data(show_status=True))
-        save_btn.pack(side="left", padx=5)
-        
-        load_btn = ctk.CTkButton(buttons_frame, text="加载", width=80, height=25,
-                                font=ctk.CTkFont(size=11), command=self.main_window.load_data)
-        load_btn.pack(side="left", padx=5)
-        
-    def create_about_tab(self):
-        """创建关于标签页"""
-        # 创建一个滚动框架来容纳关于内容
-        about_scrollable_frame = ctk.CTkScrollableFrame(self.main_window.about_tab)
-        about_scrollable_frame.pack(fill="both", expand=True, padx=10, pady=5)
-        
-        about_label = ctk.CTkLabel(about_scrollable_frame, text="反截屏管理程序", font=ctk.CTkFont(size=14, weight="bold"))
-        about_label.pack(pady=(3, 1))
-        
-        version_label = ctk.CTkLabel(about_scrollable_frame, text="版本 1.0")
-        version_label.pack(pady=1)
-        
-        description_label = ctk.CTkLabel(about_scrollable_frame, text="基于Windows Display Affinity技术和DLL注入的进程窗口反截屏保护工具")
-        description_label.pack(pady=1)
-        
-        features_label = ctk.CTkLabel(about_scrollable_frame, text="核心技术特性：", font=ctk.CTkFont(weight="bold"))
-        features_label.pack(anchor="w", padx=5, pady=(5, 1))
-        
-        feature_list = ctk.CTkLabel(about_scrollable_frame, text=
-            "- 基于DLL注入技术实现反截屏保护\n"
-            "- 使用多种Affinity DLL防止屏幕录制\n"
-            "- 支持进程级和窗口级精细控制\n"
-            "- 多线程实时监控和更新窗口亲和性\n"
-            "- 支持配置持久化和主题切换\n"
-            "- 使用psutil库进行系统进程管理",
-            justify="left", anchor="w")
-        feature_list.pack(padx=10, pady=1, anchor="w")
-        
-        # 添加DLL说明
-        dll_label = ctk.CTkLabel(about_scrollable_frame, text="DLL功能说明：", font=ctk.CTkFont(weight="bold"))
-        dll_label.pack(anchor="w", padx=5, pady=(5, 1))
-        
-        dll_list = ctk.CTkLabel(about_scrollable_frame, text=
-            "- AffinityHide.dll: 模式二反截屏保护\n"
-            "- AffinityTrans.dll: 模式一反截屏保护\n"
-            "- AffinityUnhide.dll: 取消反截屏保护\n"
-            "- AffinityStatus.dll: 检查进程保护状态",
-            justify="left", anchor="w")
-        dll_list.pack(padx=10, pady=1, anchor="w")
-
-        # 添加技术说明
-        tech_label = ctk.CTkLabel(about_scrollable_frame, text="技术说明", font=ctk.CTkFont(size=12, weight="bold"))
-        tech_label.pack(pady=(5, 1), anchor="w", padx=5)
-
-        tech_text = ctk.CTkLabel(about_scrollable_frame, text=
-            "1. 利用Windows API实现DLL远程注入\n"
-            "2. 通过DLL中的SetWindowDisplayAffinity API设置窗口属性\n"
-            "3. 使用FindWindowEx遍历系统窗口句柄\n"
-            "4. 多线程异步处理避免界面卡顿\n"
-            "5. JSON格式配置文件存储用户设置\n"
-            "6. 基于CustomTkinter现代UI框架构建",
-            justify="left", anchor="w")
-        tech_text.pack(padx=10, pady=1, anchor="w")
-
-
-        tech_label = ctk.CTkLabel(about_scrollable_frame, text="关于", font=ctk.CTkFont(size=12, weight="bold"))
-        tech_label.pack(pady=(5, 1), anchor="w", padx=5)
-
-
-
-        tech_label = ctk.CTkLabel(about_scrollable_frame, text="关于", font=ctk.CTkFont(size=12, weight="bold"))
-        tech_label.pack(pady=(5, 1), anchor="w", padx=5)
-
-        tech_text = ctk.CTkLabel(about_scrollable_frame, text=
-            "这个工具注入的dll由icer233的DisplayAffinityManager项目生产，在此感谢icer233\n"
-            "在此基础上进行了封装和扩展，增加了界面和更多功能\n"
-            "原项目地址：https://github.com/icer233/AntiScreenshotManager\n"
-            "二次开发作者在bilibili上名简朴无谓，欢迎关注",
-            justify="left", anchor="w")
-        tech_text.pack(padx=10, pady=1, anchor="w")
+from dll_injector import DLLInjector
+from ui_components import UIComponents
+from data_manager import DataManager
+from loader import ProcessLoader, WindowLoader
 
 
 class MainWindow(ctk.CTk):
@@ -1032,6 +35,9 @@ class MainWindow(ctk.CTk):
         # 创建UI组件管理器
         self.ui_components = UIComponents(self)
         
+        # 创建数据管理器
+        self.data_manager = DataManager(self)
+        
         # 创建主布局
         self.ui_components.create_main_layout()
         
@@ -1052,11 +58,23 @@ class MainWindow(ctk.CTk):
         self.after(100, self.initial_refresh)
         
         # 移除白名单相关的变量初始化，因为我们已移除白名单功能
-
+        
+        # 添加开关节流控制
+        self._last_toggle_time = 0
+        self._pending_save = False
+        
+        # 添加设置界面开关节流控制
+        self._last_setting_toggle_time = 0
+        
     def _extract_dll_files_if_needed(self):
         """
         如果需要，将DLL文件从打包程序中解压到程序同目录
         """
+        # 检查是否在PyInstaller打包环境中运行
+        if not hasattr(sys, '_MEIPASS'):
+            # 不在打包环境中，跳过解压
+            return
+            
         # 检查目标DLL目录是否已存在
         target_dll_dir = os.path.join(os.path.dirname(sys.executable), "dll")
         if os.path.exists(target_dll_dir):
@@ -1100,6 +118,7 @@ class MainWindow(ctk.CTk):
                 print(f"解压DLL文件时出错: {e}")
         else:
             print(f"源DLL目录不存在: {source_dll_dir}")
+            
     def init_components(self):
         """初始化所有组件"""
         # 创建左侧模式一列表
@@ -1119,159 +138,12 @@ class MainWindow(ctk.CTk):
 
     def save_data(self, show_status=True):
         """保存数据到配置文件"""
-        try:
-            # 收集所有需要保存的数据
-            config_data = {
-                "theme": self.theme_var.get(),
-                "mode1_items": [],
-                "mode2_items": [],
-                "current_mode": self.current_mode,
-                "child_process_injection_enabled": self.child_process_injection_var.get(),  # 保存子进程注入开关状态
-                "auto_start_enabled": self.auto_start_var.get()  # 保存开机自启动设置
-            }
-            
-            # 保存模式一列表项
-            for i in range(self.mode1_listbox.size()):
-                item_text = self.mode1_listbox.get(i)
-                # 检查是否有状态指示器（红点表示禁用，绿点表示启用）
-                is_enabled = True
-                if item_text.startswith("● "):
-                    # 获取项目状态
-                    is_enabled = getattr(self.mode1_listbox, f"item_{i}_status", "enabled") != "disabled"
-                    # 保存时不带状态指示器的文本
-                    clean_text = item_text[2:]
-                else:
-                    clean_text = item_text
-                    
-                config_data["mode1_items"].append({
-                    "text": clean_text,
-                    "enabled": is_enabled
-                })
-            
-            # 保存模式二列表项
-            for i in range(self.mode2_listbox.size()):
-                item_text = self.mode2_listbox.get(i)
-                # 检查是否有状态指示器（红点表示禁用，绿点表示启用）
-                is_enabled = True
-                if item_text.startswith("● "):
-                    # 获取项目状态
-                    is_enabled = getattr(self.mode2_listbox, f"item_{i}_status", "disabled") != "disabled"
-                    # 保存时不带状态指示器的文本
-                    clean_text = item_text[2:]
-                else:
-                    clean_text = item_text
-                    
-                config_data["mode2_items"].append({
-                    "text": clean_text,
-                    "enabled": is_enabled
-                })
-            
-            # 保存到配置文件
-            config_file = "config.json"
-            with open(config_file, "w", encoding="utf-8") as f:
-                json.dump(config_data, f, ensure_ascii=False, indent=4)
-            
-            # 只在手动保存时显示状态信息
-            if show_status:
-                self.status_label.configure(text=f"配置已保存到 {config_file}")
-        except Exception as e:
-            if show_status:
-                self.status_label.configure(text=f"保存配置失败: {str(e)}")
-    
+        self.data_manager.save_data(show_status)
+        
     def load_data(self):
         """从配置文件加载数据"""
-        try:
-            config_file = "config.json"
-            if not os.path.exists(config_file):
-                self.status_label.configure(text="配置文件不存在")
-                # 即使没有配置文件，也要刷新列表
-                self.after(100, self._delayed_list_refresh)
-                return
-                
-            # 从配置文件加载数据
-            with open(config_file, "r", encoding="utf-8") as f:
-                config_data = json.load(f)
-            
-            # 恢复主题设置
-            theme = config_data.get("theme", "Light")
-            self.theme_var.set(theme)
-            self.change_theme()
-            
-            # 恢复反截屏开关状态（已移除程序自身反截屏功能）
-            anti_screenshot_enabled = config_data.get("anti_screenshot_enabled", True)
-            # 程序自身反截屏功能已移除，忽略此配置
-            # 根据配置设置反截屏功能，但仅在开关启用时才执行
-            if anti_screenshot_enabled:
-                # 程序自身反截屏功能已移除，忽略此配置
-                pass
-            
-            # 恢复子进程注入开关状态
-            child_process_injection_enabled = config_data.get("child_process_injection_enabled", False)
-            self.child_process_injection_var.set(child_process_injection_enabled)
-            
-            # 清空现有列表
-            self.mode1_listbox.delete(0, tk.END)
-            self.mode2_listbox.delete(0, tk.END)
-            
-            # 恢复模式一列表项
-            for item in config_data.get("mode1_items", []):
-                item_text = item["text"]
-                is_enabled = item.get("enabled", True)
-                
-                # 根据状态添加适当的指示器
-                if not is_enabled:
-                    display_text = "● " + item_text
-                    # 为禁用项设置状态属性
-                    index = self.mode1_listbox.size()
-                    setattr(self.mode1_listbox, f"item_{index}_status", "disabled")
-                else:
-                    display_text = item_text
-                    index = self.mode1_listbox.size()
-                    setattr(self.mode1_listbox, f"item_{index}_status", "enabled")
-                    
-                self.mode1_listbox.insert(tk.END, display_text)
-            
-            # 恢复模式二列表项
-            for item in config_data.get("mode2_items", []):
-                item_text = item["text"]
-                is_enabled = item.get("enabled", True)
-                
-                # 根据状态添加适当的指示器
-                if not is_enabled:
-                    display_text = "●" + item_text
-                    # 为禁用项设置状态属性
-                    index = self.mode2_listbox.size()
-                    setattr(self.mode2_listbox, f"item_{index}_status", "disabled")
-                else:
-                    display_text = item_text
-                    index = self.mode2_listbox.size()
-                    setattr(self.mode2_listbox, f"item_{index}_status", "enabled")
-                    
-                self.mode2_listbox.insert(tk.END, display_text)
-            
-            # 恢复当前模式
-            self.current_mode = config_data.get("current_mode", 1)
-            if self.current_mode == 1:
-                self.toggle_button.configure(text="当前模式: 模式一")
-            else:
-                self.toggle_button.configure(text="当前模式: 模式二")
-            
-            # 应用反截屏保护（两个列表都需要应用）
-            # 使用延迟确保UI已完全初始化
-            self.after(100, lambda: self.apply_anti_screenshot_protection(self.mode1_listbox))
-            self.after(150, lambda: self.apply_anti_screenshot_protection(self.mode2_listbox))
-            
-            self.status_label.configure(text="配置加载成功")
-            
-            # 延迟刷新列表，确保在应用反截屏保护之后
-            self.after(200, self._delayed_list_refresh)
-        except Exception as e:
-            self.status_label.configure(text=f"加载配置失败: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            # 即使加载配置失败，也要刷新列表
-            self.after(100, self._delayed_list_refresh)
-            
+        self.data_manager.load_data()
+
     def _delayed_list_refresh(self):
         """延迟刷新列表"""
         self.refresh_processes_list()
@@ -1572,7 +444,7 @@ class MainWindow(ctk.CTk):
                 if already_exists_in_other:
                     self.status_label.configure(text=f"项目 '{item_text}' 已存在于 {other_mode_name} 中，无法同时添加到两个列表")
                 else:
-                    listbox.insert(tk.END, item_text)
+                    listbox.insert("end", item_text)
                     # 为新项目设置默认状态
                     index = listbox.size() - 1
                     setattr(listbox, f'item_{index}_status', 'enabled')
@@ -1618,7 +490,7 @@ class MainWindow(ctk.CTk):
             self.status_label.configure(text=f"已清空 {mode_name}")
             
         # 清空列表
-        listbox.delete(0, tk.END)
+        listbox.delete(0, "end")
         # 自动保存配置
         self.save_data(show_status=False)
         
@@ -1941,7 +813,7 @@ class MainWindow(ctk.CTk):
             
         if is_enabled:
             # 切换到关闭状态（红点）
-            new_text = "●" + clean_text
+            new_text = "● " + clean_text
             listbox.insert(index, new_text)
             setattr(listbox, f'item_{index}_status', 'disabled')
             self.status_label.configure(text=f"'{clean_text}' 在 {mode_name} 中已关闭")
@@ -1950,7 +822,7 @@ class MainWindow(ctk.CTk):
             threading.Thread(target=self._unhide_process_thread, args=(clean_text,), daemon=True).start()
         else:
             # 切换到开启状态（绿点）
-            new_text = "●" + clean_text
+            new_text = "● " + clean_text
             listbox.insert(index, new_text)
             setattr(listbox, f'item_{index}_status', 'enabled')
             self.status_label.configure(text=f"'{clean_text}' 在 {mode_name} 中已开启")
@@ -2213,29 +1085,26 @@ class MainWindow(ctk.CTk):
         self.save_data(show_status=False)
 
     def change_theme(self):
-        """更改主题"""
-        theme = self.theme_var.get()
-        ctk.set_appearance_mode(theme)
+        """改变主题"""
+        import time
+        current_time = time.time()
         
-        # 根据主题更改列表框颜色
-        if theme == "Dark":
-            # 深色主题：黑底白字
-            listbox_bg = "black"
-            listbox_fg = "white"
-        else:
-            # 浅色主题：白底黑字
-            listbox_bg = "white"
-            listbox_fg = "black"
+        # 限制设置界面开关每秒只能切换一次
+        if current_time - self._last_setting_toggle_time < 1.0:
+            return
             
-        # 更新所有列表框的颜色（移除对白名单列表的引用，因为我们已移除白名单功能）
-        # 只更新现有的列表框
-        for listbox in [self.mode1_listbox, self.mode2_listbox, self.window_listbox, self.process_listbox]:
-            listbox.config(bg=listbox_bg, fg=listbox_fg)
+        self._last_setting_toggle_time = current_time
+        
+        # 更改主题
+        theme = self.theme_var.get()
+        if theme == "Dark":
+            ctk.set_appearance_mode("Dark")
+        else:
+            ctk.set_appearance_mode("Light")
             
         # 自动保存配置
-        self.save_data(show_status=False)
-
-
+        self._schedule_auto_save()
+        
     def is_auto_start_enabled(self):
         """检查开机自启动是否已启用"""
         try:
@@ -2260,42 +1129,26 @@ class MainWindow(ctk.CTk):
             return False
 
     def toggle_auto_start(self):
-        """切换开机自启动状态"""
-        try:
-            import winreg
-            # 获取当前程序路径
-            exe_path = os.path.abspath(sys.argv[0])
+        """切换开机自启动功能的启用状态"""
+        import time
+        current_time = time.time()
+        
+        # 限制设置界面开关每秒只能切换一次
+        if current_time - self._last_setting_toggle_time < 1.0:
+            return
             
+        self._last_setting_toggle_time = current_time
+        
+        try:
+            # 根据开关状态启用或禁用开机自启动
             if self.auto_start_var.get():
-                # 启用开机自启动
-                key = winreg.OpenKey(
-                    winreg.HKEY_CURRENT_USER,
-                    r"Software\Microsoft\Windows\CurrentVersion\Run",
-                    0,
-                    winreg.KEY_SET_VALUE
-                )
-                winreg.SetValueEx(key, "AntiScreenshotManager", 0, winreg.REG_SZ, exe_path)
-                winreg.CloseKey(key)
-                self.status_label.configure(text="已启用开机自启动")
+                self.enable_auto_start()
             else:
-                # 禁用开机自启动
-                key = winreg.OpenKey(
-                    winreg.HKEY_CURRENT_USER,
-                    r"Software\Microsoft\Windows\CurrentVersion\Run",
-                    0,
-                    winreg.KEY_SET_VALUE
-                )
-                try:
-                    winreg.DeleteValue(key, "AntiScreenshotManager")
-                    self.status_label.configure(text="已禁用开机自启动")
-                except FileNotFoundError:
-                    # 键不存在，说明已经是禁用状态
-                    self.status_label.configure(text="已禁用开机自启动")
-                winreg.CloseKey(key)
+                self.disable_auto_start()
         except Exception as e:
-            error_msg = f"设置开机自启动时出错: {e}"
-            print(error_msg)
-            self.status_label.configure(text=error_msg)
+            self.status_label.configure(text=f"切换开机自启动时出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
     def refresh_processes_list(self):
         """刷新进程列表"""
@@ -2322,11 +1175,11 @@ class MainWindow(ctk.CTk):
         self.after(0, lambda: self._update_process_list(processes))
         
     def _update_process_list(self, processes):
-        self.process_listbox.delete(0, tk.END)
+        self.process_listbox.delete(0, "end")
         
         # 逐个添加进程到列表（懒加载）
         for display_text, process_name in processes:
-            self.process_listbox.insert(tk.END, display_text)
+            self.process_listbox.insert("end", display_text)
             
         self.status_label.configure(text=f"已刷新进程列表，共找到 {len(processes)} 个不同的进程")
         self.progress_bar.pack_forget()  # 隐藏进度条
@@ -2358,11 +1211,11 @@ class MainWindow(ctk.CTk):
         self.after(0, lambda: self._update_window_list(windows))
         
     def _update_window_list(self, windows):
-        self.window_listbox.delete(0, tk.END)
+        self.window_listbox.delete(0, "end")
         
         # 逐个添加窗口到列表（懒加载）
         for display_text, process_name in windows:
-            self.window_listbox.insert(tk.END, display_text)
+            self.window_listbox.insert("end", display_text)
             
         self.status_label.configure(text=f"已刷新窗口列表，共找到 {len(windows)} 个不同的窗口")
         self.progress_bar.pack_forget()  # 隐藏进度条
@@ -2671,20 +1524,174 @@ class MainWindow(ctk.CTk):
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             return False
     
-    # 以下所有白名单相关功能已移除
-    pass
-
-# 添加主程序入口点
-if __name__ == "__main__":
-    # 避免在子进程中创建GUI
-    import sys
-    if len(sys.argv) > 1:
-        # 这是一个子进程调用，不创建GUI
-        sys.exit(0)
+    # 全屏反截屏功能相关方法
+    def toggle_fullscreen_antiscreenshot(self):
+        """切换全屏反截屏保护的启用状态"""
+        import time
+        current_time = time.time()
         
-    # 设置customtkinter的外观模式和主题
-    ctk.set_appearance_mode("Light")  # 默认设置为浅色模式
-    ctk.set_default_color_theme("green")
+        # 限制设置界面开关每秒只能切换一次
+        if current_time - self._last_setting_toggle_time < 1.0:
+            return
+            
+        self._last_setting_toggle_time = current_time
         
-    app = MainWindow()
-    app.mainloop()
+        try:
+            if self.fullscreen_antiscreenshot_var.get():
+                # 启用全屏反截屏保护
+                # 导入全屏反截屏模块
+                if not hasattr(self, 'fullscreen_antiscreenshot'):
+                    from fullscreen_antiscreenshot import FullScreenAntiScreenshot
+                    # 获取设置的间隔值
+                    try:
+                        interval = float(self.fullscreen_interval_var.get())
+                    except ValueError:
+                        interval = 0.1  # 默认值
+                    
+                    # 获取连续保护设置
+                    continuous = self.continuous_protection_var.get() if hasattr(self, 'continuous_protection_var') else True
+                    
+                    self.fullscreen_antiscreenshot = FullScreenAntiScreenshot(
+                        protection_interval=interval,
+                        protection_enabled=True,  # 默认启用
+                        continuous_protection=continuous
+                    )
+                
+                # 启用保护
+                self.fullscreen_antiscreenshot.set_protection_enabled(True)
+                # 如果还没有启动，则启动
+                if not hasattr(self.fullscreen_antiscreenshot, '_thread_started'):
+                    import threading
+                    thread = threading.Thread(target=self.fullscreen_antiscreenshot.start, daemon=True)
+                    thread.start()
+                    self.fullscreen_antiscreenshot._thread_started = True
+                self.status_label.configure(text="全屏反截屏保护已启用")
+            else:
+                # 禁用全屏反截屏保护
+                if hasattr(self, 'fullscreen_antiscreenshot'):
+                    # 先禁用保护
+                    self.fullscreen_antiscreenshot.set_protection_enabled(False)
+                    # 然后停止并销毁窗口（确保在主线程中执行）
+                    self.after(0, lambda: self._safe_stop_fullscreen_antiscreenshot())
+                self.status_label.configure(text="全屏反截屏保护已禁用")
+                
+            # 自动保存配置
+            self._schedule_auto_save()
+        except Exception as e:
+            self.status_label.configure(text=f"切换全屏反截屏保护时出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    def _safe_stop_fullscreen_antiscreenshot(self):
+        """安全地停止全屏反截屏保护"""
+        try:
+            if hasattr(self, 'fullscreen_antiscreenshot'):
+                self.fullscreen_antiscreenshot.stop()
+                # 移除引用以便重新创建
+                delattr(self, 'fullscreen_antiscreenshot')
+        except Exception as e:
+            print(f"停止全屏反截屏保护时出错: {e}")
+    
+    def toggle_continuous_protection(self):
+        """切换连续保护功能的启用状态"""
+        import time
+        current_time = time.time()
+        
+        # 限制设置界面开关每秒只能切换一次
+        if current_time - self._last_setting_toggle_time < 1.0:
+            return
+            
+        self._last_setting_toggle_time = current_time
+        
+        try:
+            if hasattr(self, 'fullscreen_antiscreenshot'):
+                continuous = self.continuous_protection_var.get()
+                self.fullscreen_antiscreenshot.set_continuous_protection(continuous)
+                status = "启用" if continuous else "禁用"
+                self.status_label.configure(text=f"连续保护已{status}")
+            else:
+                self.status_label.configure(text="请先启用全屏反截屏保护")
+        except Exception as e:
+            self.status_label.configure(text=f"切换连续保护时出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    def toggle_child_process_injection(self):
+        """切换子进程注入功能的启用状态"""
+        import time
+        current_time = time.time()
+        
+        # 限制设置界面开关每秒只能切换一次
+        if current_time - self._last_setting_toggle_time < 1.0:
+            return
+            
+        self._last_setting_toggle_time = current_time
+        
+        try:
+            pass  # 子进程注入开关的操作已经在其他地方处理
+        except Exception as e:
+            self.status_label.configure(text=f"切换子进程注入时出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    def toggle_auto_start(self):
+        """切换开机自启动功能的启用状态"""
+        import time
+        current_time = time.time()
+        
+        # 限制设置界面开关每秒只能切换一次
+        if current_time - self._last_setting_toggle_time < 1.0:
+            return
+            
+        self._last_setting_toggle_time = current_time
+        
+        try:
+            # 根据开关状态启用或禁用开机自启动
+            if self.auto_start_var.get():
+                self.enable_auto_start()
+            else:
+                self.disable_auto_start()
+        except Exception as e:
+            self.status_label.configure(text=f"切换开机自启动时出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    def apply_fullscreen_interval(self):
+        """应用全屏反截屏保护的间隔设置"""
+        import time
+        current_time = time.time()
+        
+        # 限制设置界面开关每秒只能切换一次
+        if current_time - self._last_setting_toggle_time < 1.0:
+            return
+            
+        self._last_setting_toggle_time = current_time
+        
+        try:
+            if hasattr(self, 'fullscreen_antiscreenshot'):
+                interval = float(self.fullscreen_interval_var.get())
+                self.fullscreen_antiscreenshot.set_protection_interval(interval)
+                self.status_label.configure(text=f"全屏反截屏保护间隔已设置为 {interval} 秒")
+            else:
+                self.status_label.configure(text="请先启用全屏反截屏保护")
+        except ValueError:
+            self.status_label.configure(text="请输入有效的数字作为间隔")
+        except Exception as e:
+            self.status_label.configure(text=f"应用间隔设置时出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    def _schedule_auto_save(self):
+        """安排自动保存，防抖动"""
+        if not self._pending_save:
+            self._pending_save = True
+            self.after(500, self._perform_auto_save)  # 延迟500ms保存
+    
+    def _perform_auto_save(self):
+        """执行自动保存"""
+        if self._pending_save:
+            self._pending_save = False
+            try:
+                self.save_data(show_status=False)  # 静默保存，不显示状态信息
+            except Exception as e:
+                print(f"自动保存配置失败: {e}")
